@@ -387,7 +387,7 @@ class LocalBrowserWatchdog(BaseWatchdog):
 
 	@staticmethod
 	async def _wait_for_cdp_url(port: int, timeout: float = 60) -> str:
-		"""Wait for the browser to start and return the CDP URL."""
+		"""Wait for the browser to start and return the CDP WebSocket URL."""
 		import aiohttp
 
 		start_time = asyncio.get_event_loop().time()
@@ -397,7 +397,12 @@ class LocalBrowserWatchdog(BaseWatchdog):
 				async with aiohttp.ClientSession() as session:
 					async with session.get(f'http://127.0.0.1:{port}/json/version') as resp:
 						if resp.status == 200:
-							# Chrome is ready
+							# Chrome is ready - get the WebSocket URL directly
+							data = await resp.json()
+							ws_url = data.get('webSocketDebuggerUrl')
+							if ws_url:
+								return ws_url
+							# Fallback to HTTP URL if no WebSocket URL found
 							return f'http://127.0.0.1:{port}/'
 						else:
 							# Chrome is starting up and returning 502/500 errors

@@ -1519,9 +1519,43 @@ class BrowserSession(BaseModel):
 			# Run a tiny HTTP client to query for the WebSocket URL from the /json/version endpoint
 			async with httpx.AsyncClient() as client:
 				headers = self.browser_profile.headers or {}
-				version_info = await client.get(url, headers=headers)
-				self.logger.debug(f'Raw version info: {str(version_info)}')
-				self.browser_profile.cdp_url = version_info.json()['webSocketDebuggerUrl']
+				last_error: Exception | None = None
+				for _ in range(10):
+					try:
+						version_info = await client.get(url, headers=headers, timeout=5.0)
+					except Exception as exc:
+						last_error = exc
+						await asyncio.sleep(0.2)
+						continue
+
+					self.logger.debug(f'Raw version info: {str(version_info)}')
+					if version_info.status_code != 200:
+						last_error = RuntimeError(
+							f'CDP /json/version returned status {version_info.status_code}'
+						)
+						await asyncio.sleep(0.2)
+						continue
+
+					try:
+						payload = version_info.json()
+					except ValueError:
+						body_preview = (version_info.text or '')[:200]
+						last_error = RuntimeError(
+							'CDP /json/version did not return JSON '
+							f'(status={version_info.status_code}, body={body_preview!r})'
+						)
+						await asyncio.sleep(0.2)
+						continue
+
+					ws_url = payload.get('webSocketDebuggerUrl')
+					if ws_url:
+						self.browser_profile.cdp_url = ws_url
+						break
+
+					last_error = RuntimeError('CDP /json/version missing webSocketDebuggerUrl')
+					await asyncio.sleep(0.2)
+				else:
+					raise RuntimeError(f'Failed to read CDP WebSocket URL from {url}: {last_error}')
 
 		assert self.cdp_url is not None, 'CDP URL is None.'
 

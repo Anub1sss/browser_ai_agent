@@ -394,15 +394,35 @@ def _build_step_handler():
 
 async def plan_task(llm, task: str) -> str:
 	"""Planner sub-agent: produce a concise plan."""
-	system = SystemMessage(
-		content=(
-			"You are a planning sub-agent. Provide a concise, numbered step-by-step plan "
-			"(5-10 steps) to accomplish the user task. Do not use browser actions; output plain text."
+	try:
+		system = SystemMessage(
+			content=(
+				"You are a planning sub-agent. Provide a concise, numbered step-by-step plan "
+				"(5-10 steps) to accomplish the user task. Do not use browser actions; output plain text."
+			)
 		)
-	)
-	user = UserMessage(content=task)
-	response = await llm.ainvoke([system, user])
-	return str(response.completion).strip()
+		user = UserMessage(content=task)
+		response = await llm.ainvoke([system, user], output_format=None)
+		if not response:
+			print('Warning: Planner returned empty response', flush=True)
+			return ""
+		if not hasattr(response, 'completion'):
+			print(f'Warning: Planner response missing completion attribute: {type(response)}', flush=True)
+			return ""
+		completion = response.completion
+		if completion is None:
+			return ""
+		plan_text = str(completion).strip()
+		if not plan_text:
+			print('Warning: Planner returned empty plan', flush=True)
+		return plan_text
+	except Exception as e:
+		import traceback
+		print(f'Warning: Planner error: {type(e).__name__}: {e}', flush=True)
+		# Only show traceback for unexpected errors
+		if 'JSON' not in type(e).__name__ and 'json' not in str(e).lower():
+			traceback.print_exc()
+		return ""
 
 
 def build_executor_instructions() -> str:
@@ -417,15 +437,18 @@ def build_executor_instructions() -> str:
 
 async def run_task(task: str, profile_config: dict) -> bool:
 	"""Run a task with the specified LLM provider."""
+	provider = profile_config.get("provider", "custom")
+	model = profile_config.get("model")
 	try:
 		llm = get_llm(
-			profile_config.get("provider", "custom"),
-			model=profile_config.get("model"),
+			provider,
+			model=model,
 			temperature=profile_config.get("temperature"),
 			max_completion_tokens=profile_config.get("max_completion_tokens"),
 		)
+		print(f'Using LLM: provider={provider}, model={model or "default"}', flush=True)
 	except Exception as e:
-		print(f'Error initializing LLM: {e}', flush=True)
+		print(f'Error initializing LLM (provider={provider}, model={model}): {e}', flush=True)
 		return False
 
 	fallback_llm = None
@@ -442,13 +465,20 @@ async def run_task(task: str, profile_config: dict) -> bool:
 		except Exception as e:
 			print(f'Planner failed: {e}', flush=True)
 
-	browser = build_browser(
-		persistent=profile_config.get("persistent_session", False),
-		profile_dir=profile_config.get("profile_dir"),
-		headless=profile_config.get("headless", False),
-		wait_between_actions=profile_config.get("wait_between_actions", DEFAULT_ACTION_DELAY_SECONDS),
-		proxy=profile_config.get("proxy"),
-	)
+	# Build browser with error handling
+	try:
+		browser = build_browser(
+			persistent=profile_config.get("persistent_session", False),
+			profile_dir=profile_config.get("profile_dir"),
+			headless=profile_config.get("headless", False),
+			wait_between_actions=profile_config.get("wait_between_actions", DEFAULT_ACTION_DELAY_SECONDS),
+			proxy=profile_config.get("proxy"),
+		)
+	except Exception as e:
+		print(f'Error creating browser: {e}', flush=True)
+		print('Make sure Chrome/Chromium is installed and accessible.', flush=True)
+		return False
+	
 	tools = build_tools()
 
 	executor_task = task
@@ -470,7 +500,45 @@ async def run_task(task: str, profile_config: dict) -> bool:
 	try:
 		await agent.run()
 	except Exception as e:
-		print(f'Task execution failed: {e}', flush=True)
+		import traceback
+		error_msg = str(e)
+		error_type = type(e).__name__
+		print(f'\n❌ Task execution failed: {error_type}: {error_msg}', flush=True)
+		
+		# Check for browser/CDP connection errors
+		if 'JSONDecodeError' in error_type and 'Expecting value' in error_msg:
+			# Check if it's a browser connection issue
+			traceback_str = ''.join(traceback.format_exc())
+			if 'cdp_url' in traceback_str or 'webSocketDebuggerUrl' in traceback_str or 'version_info.json' in traceback_str:
+				print('\n🔧 Browser Connection Error:', flush=True)
+				print('   The browser failed to start or connect via CDP (Chrome DevTools Protocol).', flush=True)
+				print('\n💡 Possible solutions:', flush=True)
+				print('   1. Make sure Chrome/Chromium is installed', flush=True)
+				print('   2. Close any existing Chrome instances that might be blocking the port', flush=True)
+				print('   3. Try running with headless=False to see browser window', flush=True)
+				print('   4. Check if another process is using the CDP port', flush=True)
+				print('   5. Restart your computer if the issue persists', flush=True)
+				print('\n📋 Full traceback:', flush=True)
+				traceback.print_exc()
+			else:
+				# It's likely an LLM API error
+				print('\n📋 Full traceback for debugging:', flush=True)
+				traceback.print_exc()
+				print('\n💡 Tip: This error often occurs when:', flush=True)
+				print('   - LLM API returned empty or invalid response', flush=True)
+				print('   - API key is invalid or expired', flush=True)
+				print('   - Network issues or API timeout', flush=True)
+				print('   - Try using a different provider or check API keys in .env', flush=True)
+		# Print traceback for other JSON/parsing errors
+		elif any(keyword in error_type or keyword in error_msg.lower() 
+		       for keyword in ['JSON', 'json', 'Expecting value', 'Parse', 'parse', 'Decode']):
+			print('\n📋 Full traceback for debugging:', flush=True)
+			traceback.print_exc()
+			print('\n💡 Tip: This error often occurs when:', flush=True)
+			print('   - LLM API returned empty or invalid response', flush=True)
+			print('   - API key is invalid or expired', flush=True)
+			print('   - Network issues or API timeout', flush=True)
+			print('   - Try using a different provider or check API keys in .env', flush=True)
 		return False
 	return True
 
